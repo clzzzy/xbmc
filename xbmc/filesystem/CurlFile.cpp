@@ -23,7 +23,7 @@
 #include "Util.h"
 #include "URL.h"
 #include "settings/AdvancedSettings.h"
-#include "settings/GUISettings.h"
+#include "settings/Settings.h"
 #include "File.h"
 
 #include <vector>
@@ -66,8 +66,7 @@ extern "C" int debug_callback(CURL_HANDLE *handle, curl_infotype info, char *out
   if (info == CURLINFO_DATA_IN || info == CURLINFO_DATA_OUT)
     return 0;
 
-  // Only shown cURL debug into with loglevel DEBUG_SAMBA or higher
-  if( g_advancedSettings.m_logLevel < LOG_LEVEL_DEBUG_SAMBA )
+  if ((g_advancedSettings.m_extraLogLevels & LOGCURL) == 0)
     return 0;
 
   CStdString strLine;
@@ -250,6 +249,8 @@ CCurlFile::CReadState::CReadState()
   m_headerdone = false;
   m_readBuffer = 0;
   m_isPaused = false;
+  m_curlHeaderList = NULL;
+  m_curlAliasList = NULL;
 }
 
 CCurlFile::CReadState::~CReadState()
@@ -360,6 +361,15 @@ void CCurlFile::CReadState::Disconnect()
   m_fileSize = 0;
   m_bufferSize = 0;
   m_readBuffer = 0;
+
+  /* cleanup */
+  if( m_curlHeaderList )
+    g_curlInterface.slist_free_all(m_curlHeaderList);
+  m_curlHeaderList = NULL;
+
+  if( m_curlAliasList )
+    g_curlInterface.slist_free_all(m_curlAliasList);
+  m_curlAliasList = NULL;
 }
 
 
@@ -367,14 +377,13 @@ CCurlFile::~CCurlFile()
 {
   Close();
   delete m_state;
+  delete m_oldState;
   g_curlInterface.Unload();
 }
 
 CCurlFile::CCurlFile()
 {
   g_curlInterface.Load(); // loads the curl dll and resolves exports etc.
-  m_curlAliasList = NULL;
-  m_curlHeaderList = NULL;
   m_opened = false;
   m_forWrite = false;
   m_inError = false;
@@ -395,6 +404,7 @@ CCurlFile::CCurlFile()
   m_httpauth = "";
   m_proxytype = PROXY_HTTP;
   m_state = new CReadState();
+  m_oldState = NULL;
   m_skipshout = false;
   m_httpresponse = -1;
 }
@@ -411,19 +421,13 @@ void CCurlFile::Close()
       Write(NULL, 0);
 
   m_state->Disconnect();
+  delete m_oldState;
+  m_oldState = NULL;
 
   m_url.Empty();
   m_referer.Empty();
   m_cookie.Empty();
 
-  /* cleanup */
-  if( m_curlAliasList )
-    g_curlInterface.slist_free_all(m_curlAliasList);
-  if( m_curlHeaderList )
-    g_curlInterface.slist_free_all(m_curlHeaderList);
-
-  m_curlAliasList = NULL;
-  m_curlHeaderList = NULL;
   m_opened = false;
   m_forWrite = false;
   m_inError = false;
@@ -469,7 +473,7 @@ void CCurlFile::SetCommonOptions(CReadState* state)
   // Enable cookie engine for current handle to re-use them in future requests
   CStdString strCookieFile;
   CStdString strTempPath = CSpecialProtocol::TranslatePath(g_advancedSettings.m_cachePath);
-  URIUtils::AddFileToFolder(strTempPath, "cookies.dat", strCookieFile);
+  strCookieFile = URIUtils::AddFileToFolder(strTempPath, "cookies.dat");
 
   g_curlInterface.easy_setopt(h, CURLOPT_COOKIEFILE, strCookieFile.c_str());
   g_curlInterface.easy_setopt(h, CURLOPT_COOKIEJAR, strCookieFile.c_str());
@@ -491,11 +495,11 @@ void CCurlFile::SetCommonOptions(CReadState* state)
   g_curlInterface.easy_setopt(h, CURLOPT_FAILONERROR, 1);
 
   // enable support for icecast / shoutcast streams
-  if ( NULL == m_curlAliasList )
+  if ( NULL == state->m_curlAliasList )
     // m_curlAliasList is used only by this one place, but SetCommonOptions can
     // be called multiple times, only append to list if it's empty.
-    m_curlAliasList = g_curlInterface.slist_append(m_curlAliasList, "ICY 200 OK");
-  g_curlInterface.easy_setopt(h, CURLOPT_HTTP200ALIASES, m_curlAliasList);
+    state->m_curlAliasList = g_curlInterface.slist_append(state->m_curlAliasList, "ICY 200 OK");
+  g_curlInterface.easy_setopt(h, CURLOPT_HTTP200ALIASES, state->m_curlAliasList);
 
   // never verify peer, we don't have any certificates to do this
   g_curlInterface.easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0);
@@ -611,22 +615,22 @@ void CCurlFile::SetCommonOptions(CReadState* state)
 
 void CCurlFile::SetRequestHeaders(CReadState* state)
 {
-  if(m_curlHeaderList)
+  if(state->m_curlHeaderList)
   {
-    g_curlInterface.slist_free_all(m_curlHeaderList);
-    m_curlHeaderList = NULL;
+    g_curlInterface.slist_free_all(state->m_curlHeaderList);
+    state->m_curlHeaderList = NULL;
   }
 
   MAPHTTPHEADERS::iterator it;
   for(it = m_requestheaders.begin(); it != m_requestheaders.end(); it++)
   {
     CStdString buffer = it->first + ": " + it->second;
-    m_curlHeaderList = g_curlInterface.slist_append(m_curlHeaderList, buffer.c_str());
+    state->m_curlHeaderList = g_curlInterface.slist_append(state->m_curlHeaderList, buffer.c_str());
   }
 
   // add user defined headers
-  if (m_curlHeaderList && state->m_easyHandle)
-    g_curlInterface.easy_setopt(state->m_easyHandle, CURLOPT_HTTPHEADER, m_curlHeaderList);
+  if (state->m_easyHandle)
+    g_curlInterface.easy_setopt(state->m_easyHandle, CURLOPT_HTTPHEADER, state->m_curlHeaderList);
 }
 
 void CCurlFile::SetCorrectHeaders(CReadState* state)
@@ -718,19 +722,19 @@ void CCurlFile::ParseAndCorrectUrl(CURL &url2)
   else if( strProtocol.Equals("http")
        ||  strProtocol.Equals("https"))
   {
-    if (g_guiSettings.GetBool("network.usehttpproxy")
-        && !g_guiSettings.GetString("network.httpproxyserver").empty()
-        && !g_guiSettings.GetString("network.httpproxyport").empty()
+    if (CSettings::Get().GetBool("network.usehttpproxy")
+        && !CSettings::Get().GetString("network.httpproxyserver").empty()
+        && !CSettings::Get().GetString("network.httpproxyport").empty()
         && m_proxy.IsEmpty())
     {
-      m_proxy = g_guiSettings.GetString("network.httpproxyserver");
-      m_proxy += ":" + g_guiSettings.GetString("network.httpproxyport");
-      if (g_guiSettings.GetString("network.httpproxyusername").length() > 0 && m_proxyuserpass.IsEmpty())
+      m_proxy = CSettings::Get().GetString("network.httpproxyserver");
+      m_proxy += ":" + CSettings::Get().GetString("network.httpproxyport");
+      if (CSettings::Get().GetString("network.httpproxyusername").length() > 0 && m_proxyuserpass.IsEmpty())
       {
-        m_proxyuserpass = g_guiSettings.GetString("network.httpproxyusername");
-        m_proxyuserpass += ":" + g_guiSettings.GetString("network.httpproxypassword");
+        m_proxyuserpass = CSettings::Get().GetString("network.httpproxyusername");
+        m_proxyuserpass += ":" + CSettings::Get().GetString("network.httpproxypassword");
       }
-      m_proxytype = (ProxyType)g_guiSettings.GetInt("network.httpproxytype");
+      m_proxytype = (ProxyType)CSettings::Get().GetInt("network.httpproxytype");
       CLog::Log(LOGDEBUG, "Using proxy %s, type %d", m_proxy.c_str(), proxyType2CUrlProxyType[m_proxytype]);
     }
 
@@ -884,6 +888,7 @@ void CCurlFile::Reset()
 bool CCurlFile::Open(const CURL& url)
 {
   m_opened = true;
+  m_seekable = true;
 
   CURL url2(url);
   ParseAndCorrectUrl(url2);
@@ -894,7 +899,6 @@ bool CCurlFile::Open(const CURL& url)
   if( m_state->m_easyHandle == NULL )
     g_curlInterface.easy_aquire(url2.GetProtocol(), url2.GetHostName(), &m_state->m_easyHandle, &m_state->m_multiHandle );
 
-  m_seekable = true;
   // setup common curl options
   SetCommonOptions(m_state);
   SetRequestHeaders(m_state);
@@ -1142,6 +1146,14 @@ int64_t CCurlFile::Seek(int64_t iFilePosition, int iWhence)
   if(m_state->Seek(nextPos))
     return nextPos;
 
+  if (m_oldState && m_oldState->Seek(nextPos))
+  {
+    CReadState *tmp = m_state;
+    m_state = m_oldState;
+    m_oldState = tmp;
+    return nextPos;
+  }
+
   if(!m_seekable)
     return -1;
 
@@ -1149,32 +1161,34 @@ int64_t CCurlFile::Seek(int64_t iFilePosition, int iWhence)
   if(m_multisession)
   {
     CURL url(m_url);
-    oldstate = m_state;
+    oldstate = m_oldState;
+    m_oldState = m_state;
     m_state = new CReadState();
 
     g_curlInterface.easy_aquire(url.GetProtocol(), url.GetHostName(), &m_state->m_easyHandle, &m_state->m_multiHandle );
 
-    // setup common curl options
-    SetCommonOptions(m_state);
+    m_state->m_fileSize = m_oldState->m_fileSize;
   }
   else
     m_state->Disconnect();
+
+  // re-setup common curl options
+  SetCommonOptions(m_state);
 
   /* caller might have changed some headers (needed for daap)*/
   SetRequestHeaders(m_state);
 
   m_state->m_filePos = nextPos;
-  if (oldstate)
-    m_state->m_fileSize = oldstate->m_fileSize;
 
   long response = m_state->Connect(m_bufferSize);
   if(response < 0 && (m_state->m_fileSize == 0 || m_state->m_fileSize != m_state->m_filePos))
   {
     m_seekable = false;
-    if(oldstate)
+    if(m_multisession && m_oldState)
     {
       delete m_state;
-      m_state = oldstate;
+      m_state = m_oldState;
+      m_oldState = oldstate;
     }
     return -1;
   }
